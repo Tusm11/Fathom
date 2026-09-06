@@ -1,0 +1,23 @@
+# Core frameworks with pinned versions for reproducibility
+crewai>=0.80.0,<1.0.0
+langgraph>=0.2.0,<1.0.0
+autogen-agentchat>=0.4.0,<1.0.0
+
+# LangChain ecosystem
+langchain>=0.3.0,<1.0.0
+langchain-groq>=0.2.0,<1.0.0
+langchain-community>=0.3.0,<1.0.0
+langchain-core>=0.3.0,<1.0.0
+
+# Data and API tools
+yfinance>=0.2.40,<1.0.0
+tavily-python>=0.5.0,<1.0.0
+python-dotenv>=1.0.0,<2.0.0
+
+# Core dependencies
+pydantic>=2.0.0,<3.0.0
+requests>=2.31.0,<3.0.0
+typing-extensions>=4.5.0
+
+# Optional: For enhanced functionality
+# crewai[tools]>=0.80.0,<1.0.0  # Uncomment for additional CrewAI tools
