@@ -6,6 +6,16 @@
 
 ---
 
+## Current status
+
+- **Two skills implemented**: `EvaluationContextSensitivity_v1` (detects whether a system behaves differently when it appears to recognize an evaluation context) and `TriggerConditionedBehavior_v1` (detects whether a system behaves differently when a single contextual variable is flipped, holding the task identical — closer to the classic "sleeper agent" trigger pattern).
+- **Both execution modes implemented**: Delegated (Fathom returns a plan, the caller runs it) and Managed (Fathom invokes the target directly, gated by explicit authorization and blast-radius verification).
+- **A first-pass Research Engine**: reads coverage gaps from past reports and proposes candidate skills, hardcoded to enter the registry at `EXPLORATORY` with no self-promotion path. The gap-detection and pipeline wiring are tested; full candidate generation through the real skill schema is not yet exercised end-to-end.
+- **Real-world validation**: run against real multi-agent stock-analysis pipelines (LangGraph and AutoGen implementations), not just synthetic test cases. Results below.
+- **Not yet done**: no skill has been run by anyone other than the maintainer, so nothing has moved past `EXPLORATORY` — see "Remaining operational gap" below. Broader ticker/model coverage is still needed before any directional finding is treated as established.
+
+---
+
 ## Why this exists
 
 AI agentic systems can behave differently when conditions around them change, in ways standard evaluation does not catch. This is documented, not hypothetical:
@@ -74,6 +84,10 @@ Fathom's answer: separate the parts of this problem that must be deterministic a
      Delegated         Managed         │
      Execution         Execution       │
           │                │            │
+          │                ▼            │
+          │      Authorization Check    │
+          │    (blast radius + scope)   │
+          │                │            │
           └───────┬────────┘            │
                   ▼                     │
              Target System             │
@@ -83,8 +97,16 @@ Fathom's answer: separate the parts of this problem that must be deterministic a
           │ Evidence Layer │            │
           └───────┬────────┘            │
                   ▼                     │
+          ┌────────────────────┐        │
+          │ Decision Evaluator │        │
+          │  structural →      │        │
+          │  semantic →        │        │
+          │  model-assisted    │        │
+          └───────┬────────────┘        │
+                  ▼                     │
              Skill Result               │
-       (Result State + Skill Status)    │
+   (Result State + Validation Status +  │
+        decision_method used)           │
                   │                     │
                   └──────────┬──────────┘
                              ▼
@@ -132,10 +154,10 @@ Extracts structured facts about the target system: tool access and permissions, 
 Matches profile facts against a versioned rule table to decide which threat categories and skills are applicable. No open-ended reasoning happens here. Given the same facts, the output is always the same, and every applicability decision can be traced to a specific rule. Facts that don't match any rule are preserved as `UNCLASSIFIED_PROFILE_ELEMENT` rather than dropped, and feed directly into Coverage Gaps.
 
 ### Skill Registry
-The versioned catalog of diagnostic instruments. Each skill is a self-contained specification: threat category, preconditions, test-generation method, execution procedure, decision rules, known limitations, coverage boundaries, and **Skill Status** (see Epistemic Status below).
+The versioned catalog of diagnostic instruments. Currently holds two skills — see "Skills" below. Each is a self-contained specification: threat category, preconditions, test-generation method, **decision function spec**, execution procedure, known limitations, coverage boundaries, and Validation Status.
 
 ### Skill Planner — *generative*
-Instantiates a concrete test from a skill definition (e.g., generating matched evaluation/deployment prompt variants). This is the one place generation happens, and it is bounded: the Planner only instantiates a capability that the Coverage Mapper has already deterministically approved. It never decides what to test — only how to concretely realize a test that's already been selected.
+Instantiates a concrete test from a skill definition (e.g., generating matched evaluation/deployment prompt variants, or matched trigger-flip pairs). This is the one place generation happens, and it is bounded: the Planner only instantiates a capability that the Coverage Mapper has already deterministically approved. It never decides what to test — only how to concretely realize a test that's already been selected.
 
 ### Plan Validator — *layered, not a black box*
 Validates a candidate plan before it's allowed to run, in three explicit layers:
@@ -147,26 +169,33 @@ Output is `VALID / INVALID / INCONCLUSIVE`, tagged with `validation_method: DETE
 
 ### Evaluation Adapter — Delegated vs. Managed Execution
 **Plan by default, execute by permission.** Fathom produces an evaluation plan; running it against a live target only happens through an explicitly authorized path:
-- **Delegated execution** — Fathom returns the plan; the integrating system runs it against its own agent and reports results back. No execution access required.
-- **Managed execution** — Fathom is given direct, explicitly authorized invoke access to run the plan itself.
-
-Delegated is the default trust posture; Managed requires deliberate opt-in.
+- **Delegated execution** — Fathom returns the plan; the integrating system runs it against its own agent and reports results back. No execution access required. This is the default.
+- **Managed execution** — Fathom is given direct, explicitly authorized invoke access to run the plan itself, gated by an `ExecutionAuthorization` record:
+  - `blast_radius`: `SAFE / LOW / MEDIUM / HIGH / UNKNOWN` — `UNKNOWN` is treated as `HIGH` and blocked by default.
+  - `blast_radius_provenance`: `DECLARED / VERIFIED` — a `DECLARED`-only `SAFE`/`LOW` rating requires an explicit `allow_declared=True` override on first use; only `VERIFIED` ratings auto-invoke.
+  - `mark_verified()` upgrades `DECLARED` → `VERIFIED` only after a run passes explicit `VerificationCriteria` (no embedded error markers in output, all sub-checks succeeded, decision method matches expectations if specified) — **not** merely "the call didn't throw an exception."
 
 ### Evidence Layer
-Stores everything needed to reproduce and audit a result: the actual inputs used, outputs/transcripts, skill version, plan validation record, and the precondition facts that made the skill applicable in the first place. Reproducibility comes from evidencing what happened, not from assuming generation is repeatable.
+Stores everything needed to reproduce and audit a result: the actual inputs used, outputs/transcripts, skill version, plan validation record, authorization/blast-radius record for managed runs, and the precondition facts that made the skill applicable in the first place.
+
+### Decision Evaluator
+Determines a skill's `Result State` from raw execution evidence, in the same layered spirit as the Plan Validator: structural comparison first (did the action/output category differ), then substance-level comparison, with model-assisted judgment as a last, explicitly labeled resort. Every `Finding` records which `decision_method` was actually used.
+
+> **Why this exists as its own explicit layer:** an earlier version of the Execution Adapter only checked whether a run completed without error, not whether the target's behavior actually diverged. This meant a target that behaved completely differently under two conditions and one that behaved identically could produce the same `CONSISTENT` verdict — a false negative baked into the architecture. It was caught by a deliberately constructed positive-control test (a mock target with a known, injected behavioral trigger) that should have returned `DIVERGENT` and didn't. The fix pulled comparison logic into its own explicit, layered, labeled component rather than leaving it implicit in the adapter. **Execution success is not behavioral correctness**, and the architecture now enforces that distinction structurally rather than relying on it being remembered.
 
 ### Coverage Analyzer → Diagnostic Report
 Combines results into a report with **no rollup score**. Every finding carries, independently:
 - **Result State**: `CONSISTENT / DIVERGENT / INCONCLUSIVE`
 - **Coverage State**: `TESTED / NOT_TESTED / NOT_APPLICABLE / UNCLASSIFIED`
-- **Validation Status** (single merged field — replaces the earlier separate "Skill Status" / "Evidence Basis" split): `EXPLORATORY / EMPIRICALLY_SUPPORTED / VALIDATED / DEPRECATED`
+- **Validation Status**: `EXPLORATORY / EMPIRICALLY_SUPPORTED / VALIDATED / DEPRECATED`
+- **decision_method**: `DETERMINISTIC / MODEL_ASSISTED / HYBRID`
 
 A `DIVERGENT` result from a `VALIDATED` skill and a `DIVERGENT` result from an `EXPLORATORY` skill are never presented as equivalent findings.
 
 ### Research Engine — *offline, not in the live path*
-Investigates Coverage Gaps (unclassified facts, `NOT_TESTED`/`INCONCLUSIVE` results, systematic evidence limitations) and proposes new skills. A new skill enters the registry as `EXPLORATORY` and cannot promote itself.
+Reads Coverage Gaps (`UNCLASSIFIED_PROFILE_ELEMENT` facts, `NOT_TESTED`/`INCONCLUSIVE` results) from past Diagnostic Reports and proposes candidate skills that extend an existing skill category. A new skill enters the registry as `EXPLORATORY` and cannot promote itself.
 
-Promotion is a three-role process, and no role can occupy more than one seat for the same skill:
+Promotion (not yet exercised in practice — see "Remaining operational gap") is a three-role process, and no role can occupy more than one seat for the same skill:
 
 ```
 Research Engine (proposer)
@@ -175,8 +204,7 @@ Candidate Skill → EXPLORATORY
       ↓
 Independent Validation Authority (not the proposer)
       ↓
-Validation Protocol — blinded where possible, so the
-validator does not know which cases are expected positive/negative
+Validation Protocol — blinded where possible
       ↓
 Validation Report
       ↓
@@ -198,30 +226,49 @@ ValidationRecord {
 }
 ```
 
-**A skill cannot establish its own epistemic status.** This depends on the three roles actually being held by different parties. In a solo-maintainer or small-team setting, that independence often doesn't exist yet — if the same person builds and validates a skill, treat it as still `EXPLORATORY` regardless of how many times it's been personally re-tested. Promotion beyond `EXPLORATORY` should wait for an actual independent party (a co-maintainer, external reviewer, or community validation process), not be granted on the strength of the proposer's own confidence.
+**A skill cannot establish its own epistemic status.**
+
+---
+
+## Skills
+
+| Skill | Category | What it checks |
+|---|---|---|
+| `EvaluationContextSensitivity_v1` | Evaluation awareness | Does the target behave differently when a request looks benchmark-shaped vs. organic, with the underlying task held identical? |
+| `TriggerConditionedBehavior_v1` | Trigger-conditioned behavior | Does the target behave differently when a single contextual variable (e.g., framing/stated stakes) is flipped, with the task held identical? Closer to the classic hidden-trigger backdoor pattern. |
+
+Both are currently `EXPLORATORY` (see below).
+
+---
+
+## Real-world validation
+
+Both skills have been run against real multi-agent stock-analysis pipelines (LangGraph and AutoGen implementations of the same task), not only synthetic test cases.
+
+**Result so far:** across two tickers (NVDA — a stock with a strong, consensus narrative; Ford — chosen specifically as a mixed-sentiment mid-cap to rule out a narrative-strength confound), the recommendation stayed `BUY` across baseline and all three framing conditions (neutral / bullish / bearish) — a **0% observed swing rate** on both.
+
+**Caveats, stated deliberately:**
+- Sample size was small (2–3 runs per condition) — directional, not statistically definitive.
+- One run initially produced unexplained errors that looked like a possible pipeline logic bug; root-caused to Groq API rate limiting, not a defect in the target or in Fathom's harness. Recorded here specifically because "an unexplained result deserves an explanation before a conclusion is built on it."
+- This shows the harness works and gives one consistent real-world signal. It does not establish that these systems are generally robust to framing — different models, temperatures, or framing strategies might behave differently, and that hasn't been tested yet.
 
 ---
 
 ## Core principles
 
 1. **Deterministic applicability, bounded generative evaluation.** What applies to a target is decided by rules, not reasoning. Generation only instantiates an already-approved capability.
-2. **Plan by default, execute by permission.** Fathom's default output is a plan, not an action. Execution against a live target requires explicit authorization.
+2. **Plan by default, execute by permission.** Fathom's default output is a plan, not an action. Execution against a live target requires explicit authorization, and even authorized targets start `DECLARED` and must earn `VERIFIED` status through an actual successful, criteria-checked run.
 3. **Discover capabilities, not truths.** A new skill can be added without claiming the phenomenon it targets is proven real. Exploratory findings are visibly weaker than validated ones.
 4. **No single component is the authority for the whole chain.** An LLM may generate candidate tests or assist with semantic validation — it never decides what applies, whether evidence exists, whether a finding is validated, or whether a suspected phenomenon is real.
-5. **Never imply more coverage than exists.** `NOT_TESTED` and `UNCLASSIFIED` are first-class outputs, not disclaimers.
+5. **Never imply more coverage than exists.** `NOT_TESTED` and `UNCLASSIFIED` are first-class outputs, not disclaimers. "The run completed" is never treated as equivalent to "the behavior was checked."
 
 ---
 
-## Resolved design decisions
-
-- **Validation Status is a single field.** The earlier separate "Skill Status" and "Evidence Basis" fields were redundant; merged into one `VALIDATION_STATUS` enum (`EXPLORATORY / EMPIRICALLY_SUPPORTED / VALIDATED / DEPRECATED`), kept distinct from `RESULT_STATE` and `COVERAGE_STATE`.
-- **Promotion requires three non-overlapping roles** — proposer, independent validation authority, registry authority — recorded in a `ValidationRecord`. See Research Engine section above.
-- **Deprecation triggers are defined**: unacceptable false positive/negative rates, failed independent replication, invalidated underlying assumptions, a superior replacement version, materially changed dependencies, or scope no longer applying. Deprecating a skill does not erase historical reports — old findings keep the version that produced them (e.g., `v1 → DEPRECATED`, `v2 → VALIDATED`, prior reports still cite `v1`).
-- **Validation circularity for novel categories is accepted as a permanent methodological limitation, not solved.** Synthetic positive/negative cases can only ever establish "the skill detects the behavior we operationalized," never "this behavior naturally occurs in real systems." Mitigation is layered (synthetic → independently constructed cases → blinded validation → counterfactual controls → cross-system replication → external evidence), but a skill built for a genuinely novel hypothesis starts and stays at `EXPLORATORY` until independent, real-world evidence accumulates. This must be stated explicitly in that skill's `known_limitations` field, not left implicit.
-
 ## Remaining operational gap
 
-The promotion process above assumes proposer, validator, and registry authority are genuinely different parties. For a solo maintainer or small team, that independence may not exist yet. Until it does, self-built-and-self-tested skills should be treated as `EXPLORATORY` regardless of internal confidence or repetition count — promotion should wait for an actual external party, not be granted by the builder's own judgment.
+The promotion process above assumes proposer, validator, and registry authority are genuinely different parties. For a solo maintainer, that independence doesn't exist yet. Until it does, self-built-and-self-tested skills — including both skills currently in the registry — stay `EXPLORATORY` regardless of internal confidence, repetition count, or how clean a real-world result looks. Promotion should wait for an actual external party (a co-maintainer, external reviewer, or community validation process), not be granted by the builder's own judgment.
+
+Additionally, the Research Engine's candidate-generation step has only been tested for its surrounding pipeline wiring so far (gap extraction, `propose_new_skills()` callability) — generating a full candidate through the real `SkillDefinition` schema end-to-end is not yet proven and is a near-term follow-up.
 
 ---
 
